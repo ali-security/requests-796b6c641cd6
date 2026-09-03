@@ -296,15 +296,25 @@ class HTTPAdapter(BaseAdapter):
         """
         proxy = select_proxy(url, proxies)
 
+        pool_kwargs = {}
+        verify = getattr(self, '_verify_get_connection', None)
+        if verify is not None:
+            cert_reqs = 'CERT_REQUIRED'
+            if verify is False:
+                cert_reqs = 'CERT_NONE'
+            if isinstance(verify, basestring):
+                pool_kwargs['ca_certs'] = verify
+            pool_kwargs['cert_reqs'] = cert_reqs
+
         if proxy:
             proxy = prepend_scheme_if_needed(proxy, 'http')
             proxy_manager = self.proxy_manager_for(proxy)
-            conn = proxy_manager.connection_from_url(url)
+            conn = proxy_manager.connection_from_url(url, pool_kwargs=pool_kwargs)
         else:
             # Only scheme should be lower case
             parsed = urlparse(url)
             url = parsed.geturl()
-            conn = self.poolmanager.connection_from_url(url)
+            conn = self.poolmanager.connection_from_url(url, pool_kwargs=pool_kwargs)
 
         return conn
 
@@ -400,7 +410,12 @@ class HTTPAdapter(BaseAdapter):
         :rtype: requests.Response
         """
 
-        conn = self.get_connection(request.url, proxies)
+        try:
+            self._verify_get_connection = verify
+            conn = self.get_connection(request.url, proxies)
+        finally:
+            if hasattr(self, '_verify_get_connection'):
+                del self._verify_get_connection
 
         self.cert_verify(conn, request.url, verify, cert)
         url = self.request_url(request, proxies)

@@ -34,6 +34,8 @@ from requests.hooks import default_hooks
 from .compat import StringIO, u
 from .utils import override_environ
 from requests.packages.urllib3.util import Timeout as Urllib3Timeout
+from requests.packages.urllib3.connectionpool import HTTPSConnectionPool
+from requests.packages.urllib3.response import HTTPResponse as Urllib3HTTPResponse
 
 # Requests to this URL should always fail with a connection timeout (nothing
 # listening on that port)
@@ -2241,6 +2243,125 @@ def test_vendor_aliases():
 
     with pytest.raises(ImportError):
         from requests.packages import webbrowser
+
+
+class TestTLSConnectionPooling:
+    """A pooled connection must never be shared across TLS settings.
+
+    Prior to this fix a :class:`requests.Session` keyed its urllib3 connection
+    pools on scheme/host/port alone, so the very first request to an origin
+    fixed the TLS verification settings used by every later request to it. A
+    session that started with ``verify=False`` therefore kept reusing the
+    unverified connections even once the caller asked for ``verify=True``.
+    """
+
+    def record_pools(self, monkeypatch):
+        """Capture the pool each request is dispatched on, without networking."""
+        pools = []
+
+        def fake_urlopen(pool, *args, **kwargs):
+            pools.append(pool)
+            return Urllib3HTTPResponse(body=io.BytesIO(b''), status=200,
+                                       preload_content=False)
+
+        monkeypatch.setattr(HTTPSConnectionPool, 'urlopen', fake_urlopen)
+        return pools
+
+    def test_different_connection_pool_for_tls_settings(self, monkeypatch):
+        pools = self.record_pools(monkeypatch)
+        s = requests.Session()
+        s.trust_env = False
+
+        s.get('https://example.com/', verify=False)
+        s.get('https://example.com/', verify=True)
+
+        assert len(pools) == 2
+        assert pools[0] is not pools[1]
+        assert pools[0].cert_reqs == 'CERT_NONE'
+        assert pools[1].cert_reqs == 'CERT_REQUIRED'
+
+    def test_same_connection_pool_for_identical_tls_settings(self, monkeypatch):
+        pools = self.record_pools(monkeypatch)
+        s = requests.Session()
+        s.trust_env = False
+
+        s.get('https://example.com/', verify=True)
+        s.get('https://example.com/', verify=True)
+
+        assert len(pools) == 2
+        assert pools[0] is pools[1]
+
+    def test_different_connection_pool_for_ca_bundles(self, monkeypatch, tmpdir):
+        ca_one = tmpdir.join('ca-one.pem')
+        ca_one.write('')
+        ca_two = tmpdir.join('ca-two.pem')
+        ca_two.write('')
+
+        pools = self.record_pools(monkeypatch)
+        s = requests.Session()
+        s.trust_env = False
+
+        s.get('https://example.com/', verify=str(ca_one))
+        s.get('https://example.com/', verify=str(ca_two))
+
+        assert len(pools) == 2
+        assert pools[0] is not pools[1]
+        assert pools[0].ca_certs == str(ca_one)
+        assert pools[1].ca_certs == str(ca_two)
+
+    def test_get_connection_keys_pools_on_tls_settings(self):
+        a = HTTPAdapter()
+        url = 'https://example.com/'
+
+        a._verify_get_connection = False
+        insecure_conn = a.get_connection(url)
+        del a._verify_get_connection
+
+        a._verify_get_connection = True
+        secure_conn = a.get_connection(url)
+        del a._verify_get_connection
+
+        assert insecure_conn is not secure_conn
+        assert insecure_conn.cert_reqs == 'CERT_NONE'
+        assert secure_conn.cert_reqs == 'CERT_REQUIRED'
+
+    def test_get_connection_keys_proxied_pools_on_tls_settings(self):
+        a = HTTPAdapter()
+        url = 'https://example.com/'
+        proxies = {'https': 'http://proxy.example.com:8080'}
+
+        a._verify_get_connection = False
+        insecure_conn = a.get_connection(url, proxies)
+        del a._verify_get_connection
+
+        a._verify_get_connection = True
+        secure_conn = a.get_connection(url, proxies)
+        del a._verify_get_connection
+
+        assert insecure_conn is not secure_conn
+        assert insecure_conn.cert_reqs == 'CERT_NONE'
+        assert secure_conn.cert_reqs == 'CERT_REQUIRED'
+
+    def test_get_connection_unaffected_without_verify_context(self):
+        """``get_connection`` keeps its old behaviour outside of ``send``."""
+        a = HTTPAdapter()
+        url = 'https://example.com/'
+
+        assert not hasattr(a, '_verify_get_connection')
+        conn = a.get_connection(url)
+
+        assert conn.cert_reqs is None
+        assert conn is a.get_connection(url)
+
+    def test_send_does_not_leak_verify_state(self, monkeypatch):
+        self.record_pools(monkeypatch)
+        s = requests.Session()
+        s.trust_env = False
+        adapter = s.get_adapter('https://example.com/')
+
+        s.get('https://example.com/', verify=False)
+
+        assert not hasattr(adapter, '_verify_get_connection')
 
 
 class TestPreparingURLs(object):
