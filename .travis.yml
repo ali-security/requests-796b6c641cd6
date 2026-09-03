@@ -1,20 +1,56 @@
 sudo: false
+# trusty/precise are retired: Travis silently remaps them to ubuntu 24.04, whose
+# python archive carries only 3.8+. focal is the newest dist still shipping 2.7.
+dist: focal
 language: python
 python:
-  - "2.6"
+  # - "2.6"  -- no archive on any dist Travis still provisions
   - "2.7"
-  - "3.3"
-  - "3.4"
+  # - "3.3"  -- no archive on any dist Travis still provisions
+  # - "3.4"  -- archive exists only for the retired xenial image
   - "3.5"
   - "3.6"
-  - "3.7-dev"
+  # - "3.7-dev"  -- Travis no longer provisions this nightly leg
   # - "pypy"  -- appears to hang
   # - "pypy3"
+env:
+  global:
+    - PIP_INDEX_URL="https://:2017-05-10T14%3A05%3A39.911571Z@time-machines-pypi.sealsecurity.io/"
 # command to install dependencies
-install: "make"
+install:
+  # MarkupSafe 1.0 (newest at the release date) is sdist-only and its setup.py
+  # imports setuptools.Feature, dropped in setuptools 46 — pin the release-era
+  # setuptools that still provides it.
+  - pip install "setuptools==35.0.2"
+  - pip install -e ".[socks]"
+  # Travis's venvs pre-install pytest 4.6.10, which satisfies ">=2.8.0" so pip
+  # never downgrades it; pytest 4 dropped the MarkDecorator-on-a-parametrize-
+  # value idiom used in tests/test_utils.py. Pin the newest release-era pytest.
+  - pip install "pytest==3.0.7" "pytest-httpbin==0.0.7" pytest-cov pytest-mock
+# pytest-httpbin 0.0.7 ships the HTTPS fixture certs it serves the test suite
+# with; they are sha1-signed and expired on 2025-06-23, so modern OpenSSL aborts
+# the handshake with CA_MD_TOO_WEAK and test_pyopenssl_redirect /
+# test_https_warnings fail. Regenerate the same chain sha256-signed and unexpired.
+# Keep the server cert CN-only with no subjectAltName: test_https_warnings
+# asserts SubjectAltNameWarning is the one warning requests emits.
+before_script:
+  - |
+    set -e
+    CERTS=$(python -c "import os, pytest_httpbin; print(os.path.join(os.path.dirname(pytest_httpbin.__file__), 'certs'))")
+    openssl req -x509 -new -nodes -newkey rsa:2048 -sha256 -days 3650 \
+      -subj "/C=US/ST=Hawaii/O=kevin1024/CN=pytest-httpbin Certificate Authority" \
+      -keyout /tmp/phb-ca.key -out /tmp/phb-cacert.pem
+    openssl req -new -nodes -newkey rsa:2048 -sha256 \
+      -subj "/C=US/ST=Hawaii/O=kevin1024/OU=kevin1024/CN=127.0.0.1" \
+      -keyout /tmp/phb-server.key -out /tmp/phb-server.csr
+    openssl x509 -req -in /tmp/phb-server.csr -CA /tmp/phb-cacert.pem \
+      -CAkey /tmp/phb-ca.key -CAcreateserial -sha256 -days 3650 \
+      -out /tmp/phb-server.crt
+    cp /tmp/phb-cacert.pem "$CERTS/cacert.pem"
+    cp /tmp/phb-server.crt "$CERTS/cert.pem"
+    cp /tmp/phb-server.key "$CERTS/key.pem"
+    openssl x509 -in "$CERTS/cert.pem" -noout -subject -dates
 # command to run tests
 script:
-  - make coverage
-after_success:
-  - pipenv run codecov
+  - py.test tests --verbose
 cache: pip
